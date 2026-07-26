@@ -1,9 +1,11 @@
-"""정산 결과 페이지 - 라이더별 주간 정산 상세 표 + 검색 + 실제 정산 엑셀 업로드(DB 영구 저장)."""
+"""정산 결과 페이지 - 라이더별 정산 상세 + 검색 + 실제 정산 엑셀 업로드(다중 파일/DB 영구 저장) + 기간 조회."""
 
 import base64
+from datetime import datetime, timedelta
 
 import dash
 import dash_bootstrap_components as dbc
+import plotly.graph_objects as go
 from dash import Input, Output, State, callback, dash_table, dcc, html
 
 import data
@@ -15,6 +17,7 @@ dash.register_page(__name__, path="/settlement", name="정산 결과")
 
 COLUMNS = [
     {"name": "이름", "id": "name"},
+    {"name": "플랫폼", "id": "platforms"},
     {"name": "총오더수", "id": "orders"},
     {"name": "총정산금액", "id": "gross"},
     {"name": "보험환급액", "id": "ins_refund"},
@@ -28,8 +31,6 @@ COLUMNS = [
 MONEY_FIELDS = {"gross", "ins_refund", "expected", "commission",
                  "withholding", "prepaid", "final"}
 
-RECORD_FIELDS = db.RECORD_FIELDS
-
 UPLOAD_STYLE = {
     "width": "100%", "height": "56px", "lineHeight": "56px",
     "borderWidth": "1px", "borderStyle": "dashed", "borderRadius": "8px",
@@ -38,184 +39,70 @@ UPLOAD_STYLE = {
 }
 
 
+def _normalize_upload(contents, filenames):
+    """dcc.Upload(multiple=True)의 contents/filename을 (내용, 파일명) 목록으로 정규화."""
+    if not contents:
+        return []
+    if not isinstance(contents, list):
+        contents = [contents]
+        filenames = [filenames]
+    return list(zip(contents, filenames))
+
+
+def _normalize_names(filenames):
+    if not filenames:
+        return []
+    return filenames if isinstance(filenames, list) else [filenames]
+
+
 def _sample_records():
-    return data.SETTLEMENT[RECORD_FIELDS].to_dict("records")
-
-
-def _initial_state():
-    """DB에 저장된 마지막 업로드가 있으면 그걸, 없으면 샘플 데이터를 초기 표시."""
-    latest = db.load_latest_batch()
-    if latest is None:
-        return _sample_records(), {"source": "sample"}
-    records, meta = latest
-    return records, {
-        "source": "upload",
-        "settlement_date": meta["settlement_date"],
-        "uploaded_at": meta["uploaded_at"],
-        "coupang_filename": meta["coupang_filename"],
-        "baemin_filename": meta["baemin_filename"],
-    }
+    recs = data.SETTLEMENT[db.RECORD_FIELDS].to_dict("records")
+    for r in recs:
+        r["platforms"] = "-"
+    return recs
 
 
 def _settlement_display_records(records):
     recs = []
     for r in records:
-        rec = {"name": r["name"], "orders": f"{int(r['orders']):,}건"}
+        rec = {
+            "name": r["name"],
+            "orders": f"{int(r['orders']):,}건",
+            "platforms": r.get("platforms") or "-",
+        }
         for field in MONEY_FIELDS:
             rec[field] = won(r[field])
         recs.append(rec)
     return recs
 
 
-def _source_badge(meta):
-    if not meta or meta.get("source") != "upload":
-        return dbc.Badge("샘플 데이터 표시 중", color="secondary", className="mb-2")
-    return dbc.Badge(
-        f"실제 업로드 데이터 · 기준일 {meta['settlement_date']} "
-        f"(업로드: {meta['uploaded_at']})",
-        color="success", className="mb-2",
-    )
+def _aggregate_by_rider(rows: list[dict]) -> list[dict]:
+    agg: dict[str, dict] = {}
+    for r in rows:
+        d = agg.setdefault(r["name"], {"name": r["name"], "platforms": set()})
+        for f in db.RECORD_FIELDS:
+            if f in ("rider_id", "name"):
+                continue
+            d[f] = d.get(f, 0) + (r.get(f) or 0)
+        if r.get("platforms"):
+            d["platforms"].update(r["platforms"].split(","))
+    result = []
+    for d in agg.values():
+        d["platforms"] = ",".join(sorted(d["platforms"]))
+        result.append(d)
+    return sorted(result, key=lambda x: -x["gross"])
 
 
-def _upload_card():
-    return dbc.Card(dbc.CardBody([
-        html.H6("실제 정산 데이터 업로드", className="mb-1"),
-        html.P("쿠팡이츠·배민 파트너센터에서 내려받은 정산 엑셀을 올리면 DB에 저장되어, "
-               "다음에 다시 접속해도 최신 업로드 데이터를 볼 수 있습니다.",
-               className="text-muted small mb-3"),
-        dbc.Row([
-            dbc.Col([
-                html.Label("쿠팡이츠 정산 엑셀", className="small fw-bold mb-1 d-block"),
-                dcc.Upload(
-                    id="upload-coupang",
-                    children=html.Div("파일을 선택하거나 끌어다 놓으세요", id="upload-coupang-label"),
-                    className="upload-box",
-                    style=UPLOAD_STYLE,
-                ),
-                dbc.Input(id="coupang-password", type="password",
-                          placeholder="엑셀 비밀번호", className="mt-2"),
-            ], md=6),
-            dbc.Col([
-                html.Label("배민 정산 엑셀", className="small fw-bold mb-1 d-block"),
-                dcc.Upload(
-                    id="upload-baemin",
-                    children=html.Div("파일을 선택하거나 끌어다 놓으세요", id="upload-baemin-label"),
-                    className="upload-box",
-                    style=UPLOAD_STYLE,
-                ),
-                dbc.Input(id="baemin-password", type="password",
-                          placeholder="엑셀 비밀번호", className="mt-2"),
-            ], md=6),
-        ], className="g-3"),
-        dbc.Button("업로드 적용", id="apply-upload-btn", color="primary", className="mt-3"),
-        html.Div(id="upload-status", className="mt-2"),
-    ]), className="panel mb-3")
+def _aggregate_by_day(rows: list[dict]) -> list[dict]:
+    agg: dict[str, dict] = {}
+    for r in rows:
+        d = agg.setdefault(r["settlement_date"], {"date": r["settlement_date"], "gross": 0, "final": 0})
+        d["gross"] += r.get("gross") or 0
+        d["final"] += r.get("final") or 0
+    return sorted(agg.values(), key=lambda x: x["date"])
 
 
-def layout():
-    default_records, default_meta = _initial_state()
-    return html.Div([
-        page_header("정산 결과", "라이더별 정산 상세 내역입니다."),
-        _upload_card(),
-        html.Div(_source_badge(default_meta), id="settlement-source-badge"),
-        html.Div(id="settlement-kpi-row"),
-        dbc.Input(id="settlement-search", placeholder="라이더 검색...",
-                  style={"maxWidth": "280px"}, className="mb-2"),
-        html.Div(id="settlement-count", className="text-muted mb-2"),
-        dash_table.DataTable(
-            id="settlement-table",
-            columns=COLUMNS,
-            data=_settlement_display_records(default_records),
-            sort_action="native",
-            page_size=12,
-            style_cell={"padding": "10px", "fontSize": "13px",
-                        "textAlign": "left", "fontFamily": "inherit"},
-            style_header={"backgroundColor": "#f8f9fb", "fontWeight": "600"},
-            style_table={"overflowX": "auto"},
-        ),
-        dcc.Store(id="settlement-store", data=default_records),
-        dcc.Store(id="settlement-meta-store", data=default_meta),
-    ])
-
-
-@callback(
-    Output("upload-coupang-label", "children"),
-    Input("upload-coupang", "filename"),
-)
-def _coupang_filename(filename):
-    return filename or "파일을 선택하거나 끌어다 놓으세요"
-
-
-@callback(
-    Output("upload-baemin-label", "children"),
-    Input("upload-baemin", "filename"),
-)
-def _baemin_filename(filename):
-    return filename or "파일을 선택하거나 끌어다 놓으세요"
-
-
-@callback(
-    Output("settlement-store", "data"),
-    Output("settlement-meta-store", "data"),
-    Output("upload-status", "children"),
-    Input("apply-upload-btn", "n_clicks"),
-    State("upload-coupang", "contents"),
-    State("upload-coupang", "filename"),
-    State("coupang-password", "value"),
-    State("upload-baemin", "contents"),
-    State("upload-baemin", "filename"),
-    State("baemin-password", "value"),
-    prevent_initial_call=True,
-)
-def _apply_upload(n_clicks, coupang_contents, coupang_filename, coupang_pw,
-                   baemin_contents, baemin_filename, baemin_pw):
-    if not coupang_contents or not baemin_contents:
-        return dash.no_update, dash.no_update, dbc.Alert(
-            "쿠팡이츠·배민 파일을 모두 선택해주세요.", color="warning", className="mb-0 py-2")
-    if not coupang_pw or not baemin_pw:
-        return dash.no_update, dash.no_update, dbc.Alert(
-            "엑셀 비밀번호를 입력해주세요.", color="warning", className="mb-0 py-2")
-
-    try:
-        coupang_bytes = base64.b64decode(coupang_contents.split(",", 1)[1])
-        baemin_bytes = base64.b64decode(baemin_contents.split(",", 1)[1])
-        settlement_date = parsers.extract_coupang_settlement_date(coupang_bytes, coupang_pw)
-        coupang_df = parsers.parse_coupang(coupang_bytes, coupang_pw)
-        baemin_df = parsers.parse_baemin(baemin_bytes, baemin_pw)
-        merged = parsers.merge_platform_settlements(coupang_df, baemin_df)
-    except Exception as e:
-        return dash.no_update, dash.no_update, dbc.Alert(
-            f"파일 처리 중 오류가 발생했습니다: {e}", color="danger", className="mb-0 py-2")
-
-    records = merged[RECORD_FIELDS].to_dict("records")
-    db.save_batch(records, settlement_date, coupang_filename, baemin_filename)
-    _, meta = db.load_latest_batch()
-    meta["source"] = "upload"
-
-    status = dbc.Alert(
-        f"업로드 완료 및 저장됨 — {coupang_filename}, {baemin_filename} "
-        f"(라이더 {len(records)}명, 기준일 {settlement_date})",
-        color="success", className="mb-0 py-2")
-    return records, meta, status
-
-
-@callback(
-    Output("settlement-source-badge", "children"),
-    Input("settlement-meta-store", "data"),
-)
-def _render_badge(meta):
-    return _source_badge(meta)
-
-
-@callback(
-    Output("settlement-table", "data"),
-    Output("settlement-count", "children"),
-    Output("settlement-kpi-row", "children"),
-    Input("settlement-search", "value"),
-    Input("settlement-store", "data"),
-)
-def _render(query, records):
-    records = records or []
+def _build_table_and_kpi(records: list[dict], query: str | None):
     total_gross = int(sum(r["gross"] for r in records))
     total_final = int(sum(r["final"] for r in records))
     kpis = dbc.Row(
@@ -226,12 +113,262 @@ def _render(query, records):
         ],
         className="g-3 mb-3",
     )
-
     filtered = records
     if query:
         q = query.strip()
         filtered = [r for r in records if q in r["name"]]
-
     return (_settlement_display_records(filtered),
             f"정산 대상 라이더수 : {len(filtered)}명",
             kpis)
+
+
+def _source_badge_sample():
+    return dbc.Badge("샘플 데이터 표시 중 (아직 업로드된 실제 데이터 없음)",
+                      color="secondary", className="mb-2")
+
+
+def _source_badge_upload(start_date, end_date):
+    label = (f"실제 업로드 데이터 · {start_date}" if start_date == end_date
+             else f"실제 업로드 데이터 · {start_date} ~ {end_date}")
+    return dbc.Badge(label, color="success", className="mb-2")
+
+
+def _trend_graph(per_day: list[dict]):
+    dates = [d["date"] for d in per_day]
+    fig = go.Figure()
+    fig.add_bar(x=dates, y=[d["final"] for d in per_day], marker_color="#4f46e5")
+    fig.update_layout(
+        margin=dict(l=10, r=10, t=10, b=10), height=220,
+        plot_bgcolor="white", showlegend=False,
+    )
+    fig.update_yaxes(showgrid=True, gridcolor="#eee")
+    return dbc.Card(dbc.CardBody([
+        html.H6("일자별 최종정산금액 추이", className="mb-2"),
+        dcc.Graph(figure=fig, config={"displayModeBar": False}),
+    ]), className="panel mb-3")
+
+
+def _upload_card():
+    return dbc.Card(dbc.CardBody([
+        html.H6("실제 정산 데이터 업로드", className="mb-1"),
+        html.P("쿠팡이츠·배민 정산 엑셀을 여러 날짜분 한꺼번에 올릴 수 있습니다. "
+               "파일마다 날짜를 자동으로 인식해 날짜별로 나눠 저장하며, "
+               "이미 저장된 날짜를 다시 올리면 그 날짜만 덮어씁니다.",
+               className="text-muted small mb-3"),
+        dbc.Row([
+            dbc.Col([
+                html.Label("쿠팡이츠 정산 엑셀 (여러 개 선택 가능)", className="small fw-bold mb-1 d-block"),
+                dcc.Upload(
+                    id="upload-coupang",
+                    children=html.Div("파일을 선택하거나 끌어다 놓으세요", id="upload-coupang-label"),
+                    className="upload-box", style=UPLOAD_STYLE, multiple=True,
+                ),
+                dbc.Input(id="coupang-password", type="password",
+                          placeholder="엑셀 비밀번호 (모든 쿠팡이츠 파일 공통)", className="mt-2"),
+            ], md=6),
+            dbc.Col([
+                html.Label("배민 정산 엑셀 (여러 개 선택 가능)", className="small fw-bold mb-1 d-block"),
+                dcc.Upload(
+                    id="upload-baemin",
+                    children=html.Div("파일을 선택하거나 끌어다 놓으세요", id="upload-baemin-label"),
+                    className="upload-box", style=UPLOAD_STYLE, multiple=True,
+                ),
+                dbc.Input(id="baemin-password", type="password",
+                          placeholder="엑셀 비밀번호 (모든 배민 파일 공통)", className="mt-2"),
+            ], md=6),
+        ], className="g-3"),
+        dbc.Button("업로드 적용", id="apply-upload-btn", color="primary", className="mt-3"),
+        html.Div(id="upload-status", className="mt-2"),
+    ]), className="panel mb-3")
+
+
+def _period_controls(min_date, max_date, start_date, end_date):
+    return dbc.Card(dbc.CardBody([
+        dbc.Row(
+            [
+                dbc.Col(
+                    dbc.ButtonGroup([
+                        dbc.Button("최근 정산일", id="btn-period-latest", size="sm",
+                                   outline=True, color="secondary"),
+                        dbc.Button("최근 7일", id="btn-period-7d", size="sm",
+                                   outline=True, color="secondary"),
+                        dbc.Button("전체 기간", id="btn-period-all", size="sm",
+                                   outline=True, color="secondary"),
+                    ]),
+                    width="auto",
+                ),
+                dbc.Col(
+                    dcc.DatePickerRange(
+                        id="settlement-date-range",
+                        min_date_allowed=min_date, max_date_allowed=max_date,
+                        start_date=start_date, end_date=end_date,
+                        display_format="YYYY-MM-DD",
+                    ),
+                    width="auto",
+                ),
+            ],
+            className="g-2 align-items-center",
+        ),
+    ]), className="panel mb-3 py-1")
+
+
+def layout():
+    bounds = db.load_date_bounds()
+    if bounds:
+        min_date, max_date = bounds
+        start_date = end_date = max_date
+    else:
+        min_date = max_date = start_date = end_date = None
+
+    return html.Div([
+        page_header("정산 결과", "라이더별 정산 상세 내역입니다."),
+        _upload_card(),
+        html.Div(id="settlement-source-badge"),
+        _period_controls(min_date, max_date, start_date, end_date),
+        html.Div(id="settlement-trend-graph-wrap"),
+        html.Div(id="settlement-kpi-row"),
+        dbc.Input(id="settlement-search", placeholder="라이더 검색...",
+                  style={"maxWidth": "280px"}, className="mb-2"),
+        html.Div(id="settlement-count", className="text-muted mb-2"),
+        dash_table.DataTable(
+            id="settlement-table",
+            columns=COLUMNS,
+            data=[],
+            sort_action="native",
+            page_size=12,
+            style_cell={"padding": "10px", "fontSize": "13px",
+                        "textAlign": "left", "fontFamily": "inherit"},
+            style_header={"backgroundColor": "#f8f9fb", "fontWeight": "600"},
+            style_table={"overflowX": "auto"},
+        ),
+    ])
+
+
+@callback(
+    Output("upload-coupang-label", "children"),
+    Input("upload-coupang", "filename"),
+)
+def _coupang_filename(filenames):
+    names = _normalize_names(filenames)
+    return ", ".join(names) if names else "파일을 선택하거나 끌어다 놓으세요"
+
+
+@callback(
+    Output("upload-baemin-label", "children"),
+    Input("upload-baemin", "filename"),
+)
+def _baemin_filename(filenames):
+    names = _normalize_names(filenames)
+    return ", ".join(names) if names else "파일을 선택하거나 끌어다 놓으세요"
+
+
+@callback(
+    Output("settlement-date-range", "start_date", allow_duplicate=True),
+    Output("settlement-date-range", "end_date", allow_duplicate=True),
+    Output("settlement-date-range", "min_date_allowed", allow_duplicate=True),
+    Output("settlement-date-range", "max_date_allowed", allow_duplicate=True),
+    Output("upload-status", "children"),
+    Input("apply-upload-btn", "n_clicks"),
+    State("upload-coupang", "contents"),
+    State("upload-coupang", "filename"),
+    State("coupang-password", "value"),
+    State("upload-baemin", "contents"),
+    State("upload-baemin", "filename"),
+    State("baemin-password", "value"),
+    prevent_initial_call=True,
+)
+def _apply_upload(n_clicks, coupang_contents, coupang_filenames, coupang_pw,
+                   baemin_contents, baemin_filenames, baemin_pw):
+    no_change = (dash.no_update, dash.no_update, dash.no_update, dash.no_update)
+
+    coupang_list = _normalize_upload(coupang_contents, coupang_filenames)
+    baemin_list = _normalize_upload(baemin_contents, baemin_filenames)
+
+    if not coupang_list and not baemin_list:
+        return *no_change, dbc.Alert(
+            "쿠팡이츠·배민 파일을 최소 하나 이상 선택해주세요.", color="warning", className="mb-0 py-2")
+    if coupang_list and not coupang_pw:
+        return *no_change, dbc.Alert(
+            "쿠팡이츠 엑셀 비밀번호를 입력해주세요.", color="warning", className="mb-0 py-2")
+    if baemin_list and not baemin_pw:
+        return *no_change, dbc.Alert(
+            "배민 엑셀 비밀번호를 입력해주세요.", color="warning", className="mb-0 py-2")
+
+    try:
+        coupang_files = [(base64.b64decode(c.split(",", 1)[1]), fn) for c, fn in coupang_list]
+        baemin_files = [(base64.b64decode(c.split(",", 1)[1]), fn) for c, fn in baemin_list]
+        merged_by_date = parsers.parse_and_merge_multi(
+            coupang_files, coupang_pw or "", baemin_files, baemin_pw or "")
+    except Exception as e:
+        return *no_change, dbc.Alert(
+            f"파일 처리 중 오류가 발생했습니다: {e}", color="danger", className="mb-0 py-2")
+
+    if not merged_by_date:
+        return *no_change, dbc.Alert(
+            "처리할 데이터를 찾지 못했습니다.", color="warning", className="mb-0 py-2")
+
+    coupang_names = ", ".join(fn for _, fn in coupang_list) or "-"
+    baemin_names = ", ".join(fn for _, fn in baemin_list) or "-"
+    for date, df in merged_by_date.items():
+        records = df[db.RECORD_FIELDS + ["platforms"]].to_dict("records")
+        db.save_batch(records, date, coupang_names, baemin_names)
+
+    dates = sorted(merged_by_date.keys())
+    min_date, max_date = db.load_date_bounds()
+    status = dbc.Alert(
+        f"업로드 완료 및 저장됨 — {len(dates)}일치({dates[0]} ~ {dates[-1]}) 반영",
+        color="success", className="mb-0 py-2")
+    return dates[0], dates[-1], min_date, max_date, status
+
+
+@callback(
+    Output("settlement-date-range", "start_date", allow_duplicate=True),
+    Output("settlement-date-range", "end_date", allow_duplicate=True),
+    Input("btn-period-latest", "n_clicks"),
+    Input("btn-period-7d", "n_clicks"),
+    Input("btn-period-all", "n_clicks"),
+    prevent_initial_call=True,
+)
+def _quick_period(n_latest, n_7d, n_all):
+    bounds = db.load_date_bounds()
+    if not bounds:
+        return dash.no_update, dash.no_update
+    min_date, max_date = bounds
+    trigger = dash.ctx.triggered_id
+    if trigger == "btn-period-latest":
+        return max_date, max_date
+    if trigger == "btn-period-7d":
+        start = (datetime.fromisoformat(max_date) - timedelta(days=6)).strftime("%Y-%m-%d")
+        return max(start, min_date), max_date
+    if trigger == "btn-period-all":
+        return min_date, max_date
+    return dash.no_update, dash.no_update
+
+
+@callback(
+    Output("settlement-table", "data"),
+    Output("settlement-count", "children"),
+    Output("settlement-kpi-row", "children"),
+    Output("settlement-source-badge", "children"),
+    Output("settlement-trend-graph-wrap", "children"),
+    Input("settlement-search", "value"),
+    Input("settlement-date-range", "start_date"),
+    Input("settlement-date-range", "end_date"),
+)
+def _render(query, start_date, end_date):
+    if not start_date or not end_date:
+        table_data, count_text, kpis = _build_table_and_kpi(_sample_records(), query)
+        return table_data, count_text, kpis, _source_badge_sample(), None
+
+    raw_rows = db.load_records_in_range(start_date, end_date)
+    if not raw_rows:
+        empty_alert = dbc.Alert("선택한 기간에 업로드된 데이터가 없습니다.",
+                                 color="warning", className="mb-0 py-2")
+        return [], "정산 대상 라이더수 : 0명", dbc.Row(className="g-3 mb-3"), empty_alert, None
+
+    per_rider = _aggregate_by_rider(raw_rows)
+    per_day = _aggregate_by_day(raw_rows)
+    table_data, count_text, kpis = _build_table_and_kpi(per_rider, query)
+    badge = _source_badge_upload(start_date, end_date)
+    trend = _trend_graph(per_day) if len(per_day) > 1 else None
+    return table_data, count_text, kpis, badge, trend

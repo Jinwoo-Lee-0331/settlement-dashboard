@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+uploads/
+settlement.db
+.env

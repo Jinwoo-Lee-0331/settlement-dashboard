@@ -11,6 +11,8 @@
     브라우저에서 http://127.0.0.1:8050 접속
 """
 
+import os
+
 import dash
 import dash_bootstrap_components as dbc
 from dash import Dash, dcc, html
@@ -44,4 +46,4 @@ def _render_sidebar(pathname):
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=True, port=int(os.environ.get("PORT", 8050)))

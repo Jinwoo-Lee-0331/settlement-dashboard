@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "settlement_dashboard",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["app.py"],
+      "port": 8050,
+      "autoPort": true
+    }
+  ]
+}

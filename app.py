@@ -34,6 +34,7 @@ app.layout = html.Div(
         dcc.Location(id="url"),
         html.Div(id="sidebar-container"),
         html.Div(dash.page_container, className="content"),
+        html.Div(id="brand-home-reload-dummy", style={"display": "none"}),
     ],
     className="app-shell",
 )
@@ -43,6 +44,21 @@ app.layout = html.Div(
 def _render_sidebar(pathname):
     """현재 경로에 맞춰 사이드바 활성 항목을 갱신."""
     return sidebar(pathname or "/")
+
+
+app.clientside_callback(
+    """
+    function(n_clicks) {
+        if (n_clicks) {
+            window.location.href = "/";
+        }
+        return window.dash_clientside.no_update;
+    }
+    """,
+    Output("brand-home-reload-dummy", "children"),
+    Input("brand-home", "n_clicks"),
+    prevent_initial_call=True,
+)
 
 
 if __name__ == "__main__":

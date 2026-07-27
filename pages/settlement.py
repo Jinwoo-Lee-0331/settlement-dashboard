@@ -1,6 +1,7 @@
 """정산 결과 페이지 - 라이더별 정산 상세 + 검색 + 실제 정산 엑셀 업로드(다중 파일/DB 영구 저장) + 기간 조회."""
 
 import base64
+import os
 from datetime import datetime, timedelta
 
 import dash
@@ -12,6 +13,9 @@ import data
 import db
 import parsers
 from components import kpi_card, page_header, won
+
+DEFAULT_COUPANG_PASSWORD = os.environ.get("COUPANG_EXCEL_PASSWORD", "")
+DEFAULT_BAEMIN_PASSWORD = os.environ.get("BAEMIN_EXCEL_PASSWORD", "")
 
 dash.register_page(__name__, path="/settlement", name="정산 결과")
 
@@ -164,6 +168,7 @@ def _upload_card():
                     className="upload-box", style=UPLOAD_STYLE, multiple=True,
                 ),
                 dbc.Input(id="coupang-password", type="password",
+                          value=DEFAULT_COUPANG_PASSWORD,
                           placeholder="엑셀 비밀번호 (모든 쿠팡이츠 파일 공통)", className="mt-2"),
             ], md=6),
             dbc.Col([
@@ -174,6 +179,7 @@ def _upload_card():
                     className="upload-box", style=UPLOAD_STYLE, multiple=True,
                 ),
                 dbc.Input(id="baemin-password", type="password",
+                          value=DEFAULT_BAEMIN_PASSWORD,
                           placeholder="엑셀 비밀번호 (모든 배민 파일 공통)", className="mt-2"),
             ], md=6),
         ], className="g-3"),

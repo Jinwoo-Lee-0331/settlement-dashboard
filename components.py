@@ -3,7 +3,7 @@
 import dash_bootstrap_components as dbc
 from dash import html
 
-BRAND = "정산플러스 - 배플"
+BRAND = "배달플러스 - 배플"
 
 NAV_ITEMS = [
     ("대시보드", "/"),
@@ -34,7 +34,10 @@ def sidebar(active_path: str = "/") -> html.Div:
             html.Div(
                 [html.Span("🛵", className="brand-logo"),
                  html.Span(BRAND, className="brand-text")],
+                id="brand-home",
+                n_clicks=0,
                 className="brand",
+                style={"cursor": "pointer"},
             ),
             dbc.Nav(links, vertical=True, pills=True, className="mt-3"),
         ],

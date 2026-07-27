@@ -212,6 +212,18 @@ def _period_controls(min_date, max_date, start_date, end_date):
     ]), className="panel mb-3 py-1")
 
 
+def _db_backend_badge():
+    backend = db.engine.url.get_backend_name()
+    if backend == "sqlite":
+        return dbc.Alert(
+            "⚠ DB: SQLite(임시 파일) 사용 중 — Render 등 배포 환경에서는 재시작/재배포 시 "
+            "데이터가 초기화됩니다. 영구 저장하려면 DATABASE_URL 환경변수에 Postgres "
+            "연결 문자열을 등록하세요.",
+            color="warning", className="mb-2 py-2",
+        )
+    return dbc.Badge(f"DB: {backend} 연결됨 (영구 저장)", color="success", className="mb-2")
+
+
 def layout():
     bounds = db.load_date_bounds()
     if bounds:
@@ -222,6 +234,7 @@ def layout():
 
     return html.Div([
         page_header("정산 결과", "라이더별 정산 상세 내역입니다."),
+        _db_backend_badge(),
         _upload_card(),
         html.Div(id="settlement-source-badge"),
         _period_controls(min_date, max_date, start_date, end_date),

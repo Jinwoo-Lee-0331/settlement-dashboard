@@ -221,7 +221,15 @@ def _db_backend_badge():
             "연결 문자열을 등록하세요.",
             color="warning", className="mb-2 py-2",
         )
-    return dbc.Badge(f"DB: {backend} 연결됨 (영구 저장)", color="success", className="mb-2")
+    host = db.engine.url.host or "-"
+    dbname = db.engine.url.database or "-"
+    bounds = db.load_date_bounds()
+    bounds_text = f"저장된 정산일: {bounds[0]} ~ {bounds[1]}" if bounds else "저장된 정산일 없음"
+    return html.Div([
+        dbc.Badge(f"DB: {backend}@{host}/{dbname} 연결됨 (영구 저장)",
+                  color="success", className="mb-1 d-block"),
+        html.Small(bounds_text, className="text-muted d-block mb-2"),
+    ])
 
 
 def layout():

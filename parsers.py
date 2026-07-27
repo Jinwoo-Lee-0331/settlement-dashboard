@@ -5,9 +5,37 @@
 """
 
 import io
+from datetime import time as dt_time
 
 import msoffcrypto
 import pandas as pd
+
+# --- 레드던 자체 미션 프로모션 (2026-07-29 안내, 소급 적용) ---------------------
+# 쿠팡이츠는 주문마다 '피크타임' 값을 직접 내려주므로 그대로 매핑해서 쓴다.
+COUPANG_PEAK_BUCKET_MAP = {
+    "Breakfast": "오전점심피크",
+    "Lunch_Peak": "오전점심피크",
+    "Post_Lunch": "오후논피크",
+    "Dinner_Peak": "저녁피크",
+    "Post_Dinner": "심야",
+}
+
+# 배민은 시간대 태그가 없어 주문시간으로 직접 분류한다. 아래 경계는 쿠팡이츠
+# 데이터에서 관측된 각 피크타임의 시간 범위에 맞춘 근사값(정시 기준)이라,
+# 실제 회사 기준과 다르면 이 값만 바꾸면 된다.
+MISSION_BUCKETS = ["오전점심피크", "오후논피크", "저녁피크", "심야"]
+BAEMIN_BUCKET_RANGES = [
+    ("오전점심피크", dt_time(7, 0), dt_time(13, 0)),
+    ("오후논피크", dt_time(13, 0), dt_time(17, 0)),
+    ("저녁피크", dt_time(17, 0), dt_time(20, 0)),
+    ("심야", dt_time(20, 0), dt_time(23, 59, 59)),
+]
+
+MISSION_THRESHOLDS = {"오전점심피크": 8, "오후논피크": 8, "저녁피크": 12, "심야": 11}
+MISSION_DAILY_BASE = 10_000
+MISSION_WEEKLY_BONUS = 150_000
+MISSION_WEEKLY_MIN_DAYS = 6
+MISSION_FAIL_NIGHT_CAP = 25
 
 
 def decrypt_excel(file_bytes: bytes, password: str) -> io.BytesIO:
@@ -98,6 +126,88 @@ def parse_baemin(file_bytes: bytes, password: str) -> pd.DataFrame:
     return grouped
 
 
+def parse_coupang_mission_counts(file_bytes: bytes, password: str) -> pd.DataFrame:
+    """쿠팡이츠 '오더별 상세 내역서' → 라이더별 미션구간 배달건수.
+
+    반환 컬럼: name, 오전점심피크, 오후논피크, 저녁피크, 심야
+    """
+    decrypted = decrypt_excel(file_bytes, password)
+    df = pd.read_excel(decrypted, sheet_name="오더별 상세 내역서", header=8)
+    df = df.dropna(subset=["성함"])
+    df["name"] = df["성함"].astype(str).str.replace(r"\d+$", "", regex=True).str.strip()
+    df["bucket"] = df["피크타임"].map(COUPANG_PEAK_BUCKET_MAP)
+    df = df.dropna(subset=["bucket"])
+    counts = df.groupby(["name", "bucket"]).size().unstack(fill_value=0)
+    for b in MISSION_BUCKETS:
+        if b not in counts.columns:
+            counts[b] = 0
+    return counts[MISSION_BUCKETS].reset_index()
+
+
+def _classify_baemin_bucket(ts) -> str | None:
+    if pd.isna(ts):
+        return None
+    t = ts.time()
+    for label, start, end in BAEMIN_BUCKET_RANGES:
+        if start <= t <= end:
+            return label
+    return None
+
+
+def parse_baemin_mission_counts(file_bytes: bytes, password: str) -> pd.DataFrame:
+    """배민 주문 상세 → 날짜·라이더별 미션구간 배달건수 (주문시간 기준 분류).
+
+    반환 컬럼: date, name, 오전점심피크, 오후논피크, 저녁피크, 심야
+    """
+    decrypted = decrypt_excel(file_bytes, password)
+    df = pd.read_excel(decrypted, sheet_name=0, header=0)
+    df = df.dropna(subset=["라이더명"])
+    df["date"] = pd.to_datetime(df["운행일"].astype(str), format="%Y%m%d").dt.strftime("%Y-%m-%d")
+    df["주문시간_dt"] = pd.to_datetime(df["주문시간"], errors="coerce")
+    df["bucket"] = df["주문시간_dt"].apply(_classify_baemin_bucket)
+    df = df.dropna(subset=["bucket"])
+    counts = (
+        df.groupby(["date", "라이더명", "bucket"]).size()
+        .unstack(fill_value=0)
+        .reset_index()
+        .rename(columns={"라이더명": "name"})
+    )
+    for b in MISSION_BUCKETS:
+        if b not in counts.columns:
+            counts[b] = 0
+    return counts[["date", "name"] + MISSION_BUCKETS]
+
+
+def compute_mission_bonus(counts: dict) -> tuple[int, bool]:
+    """4구간 배달건수(dict)로 (당일 미션 보너스 금액, ALL CLEAR 여부)를 계산."""
+    lunch = counts.get("오전점심피크", 0)
+    afternoon = counts.get("오후논피크", 0)
+    dinner = counts.get("저녁피크", 0)
+    night = counts.get("심야", 0)
+
+    all_clear = (
+        lunch >= MISSION_THRESHOLDS["오전점심피크"]
+        and afternoon >= MISSION_THRESHOLDS["오후논피크"]
+        and dinner >= MISSION_THRESHOLDS["저녁피크"]
+        and night >= MISSION_THRESHOLDS["심야"]
+    )
+    if all_clear:
+        bonus = MISSION_DAILY_BASE
+        if afternoon > MISSION_THRESHOLDS["오후논피크"]:
+            bonus += (afternoon - MISSION_THRESHOLDS["오후논피크"]) * 1000
+        if night > MISSION_THRESHOLDS["심야"]:
+            bonus += (night - MISSION_THRESHOLDS["심야"]) * 1000
+        return bonus, True
+
+    # ALL CLEAR 실패시 프로모션: 저녁피크·심야 미션을 모두 채워야 심야 초과분 지급
+    if dinner >= MISSION_THRESHOLDS["저녁피크"] and night >= MISSION_THRESHOLDS["심야"]:
+        capped_night = min(night, MISSION_FAIL_NIGHT_CAP)
+        if capped_night > MISSION_THRESHOLDS["심야"]:
+            return (capped_night - MISSION_THRESHOLDS["심야"]) * 1000, False
+
+    return 0, False
+
+
 def merge_platform_settlements(coupang_df: pd.DataFrame, baemin_df: pd.DataFrame) -> pd.DataFrame:
     """두 플랫폼 라이더별 정산 데이터를 이름 기준으로 합쳐 data.SETTLEMENT 스키마로 변환."""
     c = coupang_df.copy()
@@ -133,6 +243,16 @@ _EMPTY_COUPANG_COLS = ["name", "orders", "gross", "employ_ins", "accident_ins",
 _EMPTY_BAEMIN_COLS = ["name", "orders", "gross"]
 
 
+_EMPTY_MISSION_COLS = ["name"] + MISSION_BUCKETS
+
+
+def _accumulate_by_date(by_date: dict, date: str, df: pd.DataFrame, sum_cols: list[str]):
+    if date in by_date:
+        df = pd.concat([by_date[date], df])
+        df = df.groupby("name", as_index=False)[sum_cols].sum()
+    by_date[date] = df
+
+
 def parse_and_merge_multi(
     coupang_files: list[tuple[bytes, str]], coupang_password: str,
     baemin_files: list[tuple[bytes, str]], baemin_password: str,
@@ -141,27 +261,34 @@ def parse_and_merge_multi(
 
     쿠팡이츠는 파일 하나 = 하루치, 배민은 파일 하나에 여러 날짜가 섞여 있을 수
     있어 각각 날짜별로 나눈 뒤, 같은 날짜끼리 merge_platform_settlements로 합친다.
-    반환: {settlement_date: 병합된 DataFrame(+platforms 컬럼)}
+    같은 날짜의 미션구간 배달건수(쿠팡+배민 합산)로 레드던 자체 미션 보너스도
+    계산해 final에 더한다.
+    반환: {settlement_date: 병합된 DataFrame(+platforms, mission_bonus, mission_all_clear)}
     """
     coupang_by_date: dict[str, pd.DataFrame] = {}
+    coupang_mission_by_date: dict[str, pd.DataFrame] = {}
     for file_bytes, _filename in coupang_files:
         date = extract_coupang_settlement_date(file_bytes, coupang_password)
         df = parse_coupang(file_bytes, coupang_password)
-        if date in coupang_by_date:
-            df = pd.concat([coupang_by_date[date], df])
-            numeric_cols = [c for c in df.columns if c != "name"]
-            df = df.groupby("name", as_index=False)[numeric_cols].sum()
-        coupang_by_date[date] = df
+        numeric_cols = [c for c in df.columns if c != "name"]
+        _accumulate_by_date(coupang_by_date, date, df, numeric_cols)
+
+        mission_df = parse_coupang_mission_counts(file_bytes, coupang_password)
+        _accumulate_by_date(coupang_mission_by_date, date, mission_df, MISSION_BUCKETS)
 
     baemin_by_date: dict[str, pd.DataFrame] = {}
     for file_bytes, _filename in baemin_files:
         df = parse_baemin(file_bytes, baemin_password)
         for date, sub in df.groupby("date"):
             sub = sub.drop(columns=["date"])
-            if date in baemin_by_date:
-                sub = pd.concat([baemin_by_date[date], sub])
-                sub = sub.groupby("name", as_index=False)[["orders", "gross"]].sum()
-            baemin_by_date[date] = sub
+            _accumulate_by_date(baemin_by_date, date, sub, ["orders", "gross"])
+
+    baemin_mission_by_date: dict[str, pd.DataFrame] = {}
+    for file_bytes, _filename in baemin_files:
+        mission_df = parse_baemin_mission_counts(file_bytes, baemin_password)
+        for date, sub in mission_df.groupby("date"):
+            sub = sub.drop(columns=["date"])
+            _accumulate_by_date(baemin_mission_by_date, date, sub, MISSION_BUCKETS)
 
     result: dict[str, pd.DataFrame] = {}
     for date in sorted(set(coupang_by_date) | set(baemin_by_date)):
@@ -181,6 +308,23 @@ def parse_and_merge_multi(
             return ",".join(tags)
 
         merged["platforms"] = merged["name"].map(_platforms)
+
+        cm_df = coupang_mission_by_date.get(date, pd.DataFrame(columns=_EMPTY_MISSION_COLS))
+        bm_df = baemin_mission_by_date.get(date, pd.DataFrame(columns=_EMPTY_MISSION_COLS))
+        mission_totals = (
+            pd.concat([cm_df, bm_df])
+            .groupby("name", as_index=False)[MISSION_BUCKETS].sum()
+        )
+        merged = merged.merge(mission_totals, on="name", how="left")
+        merged[MISSION_BUCKETS] = merged[MISSION_BUCKETS].fillna(0).infer_objects(copy=False)
+
+        bonus_all_clear = merged[MISSION_BUCKETS].apply(
+            lambda row: compute_mission_bonus(row.to_dict()), axis=1)
+        merged["mission_bonus"] = bonus_all_clear.map(lambda t: t[0])
+        merged["mission_all_clear"] = bonus_all_clear.map(lambda t: t[1])
+        merged["final"] = merged["final"] + merged["mission_bonus"]
+        merged = merged.drop(columns=MISSION_BUCKETS)
+
         result[date] = merged
 
     return result

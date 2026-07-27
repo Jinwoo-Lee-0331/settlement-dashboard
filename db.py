@@ -52,18 +52,24 @@ settlement_records = Table(
     Column("batch_id", Integer, ForeignKey("settlement_batches.id"), nullable=False),
     Column("name", String),
     Column("platforms", String),  # "coupang", "baemin", "coupang,baemin"
+    Column("mission_bonus", Float),  # 레드던 자체 미션 프로모션 당일 지급액 (final에 이미 합산됨)
+    Column("mission_all_clear", Integer),  # 그 날 4구간 ALL CLEAR 여부 (0/1, 주간보너스 계산용)
     *[Column(f, Float) for f in RECORD_FIELDS if f != "name"],
 )
 
 
 def init_db():
     metadata.create_all(engine)
-    # settlement_date에 UNIQUE 제약이 없던 구버전 DB, platforms 컬럼이 없던 구버전 DB 보정
+    # 구버전 DB에 없던 컬럼들을 보정 (platforms, mission_bonus, mission_all_clear)
     inspector = inspect(engine)
     existing_cols = {c["name"] for c in inspector.get_columns("settlement_records")}
-    if "platforms" not in existing_cols:
-        with engine.begin() as conn:
+    with engine.begin() as conn:
+        if "platforms" not in existing_cols:
             conn.execute(text("ALTER TABLE settlement_records ADD COLUMN platforms VARCHAR"))
+        if "mission_bonus" not in existing_cols:
+            conn.execute(text("ALTER TABLE settlement_records ADD COLUMN mission_bonus FLOAT"))
+        if "mission_all_clear" not in existing_cols:
+            conn.execute(text("ALTER TABLE settlement_records ADD COLUMN mission_all_clear INTEGER"))
 
 
 def _find_batch_id(conn, settlement_date: str):
@@ -105,6 +111,8 @@ def save_batch(records: list[dict], settlement_date: str,
             {
                 "batch_id": batch_id,
                 "platforms": r.get("platforms", ""),
+                "mission_bonus": r.get("mission_bonus", 0),
+                "mission_all_clear": int(r.get("mission_all_clear", 0)),
                 **{f: r.get(f, 0) for f in RECORD_FIELDS},
             }
             for r in records
@@ -128,7 +136,15 @@ def load_latest_batch() -> tuple[list[dict], dict] | None:
             select(settlement_records)
             .where(settlement_records.c.batch_id == batch["id"])
         ).mappings().all()
-        records = [{f: row[f] for f in RECORD_FIELDS} for row in rows]
+        records = [
+            {
+                **{f: row[f] for f in RECORD_FIELDS},
+                "platforms": row["platforms"] or "",
+                "mission_bonus": row["mission_bonus"] or 0,
+                "mission_all_clear": bool(row["mission_all_clear"]),
+            }
+            for row in rows
+        ]
         meta = dict(batch)
         return records, meta
 
@@ -171,9 +187,26 @@ def load_records_in_range(start_date: str, end_date: str) -> list[dict]:
             rec = {f: (row[f] or 0) for f in RECORD_FIELDS}
             rec["name"] = row["name"]
             rec["platforms"] = row["platforms"] or ""
+            rec["mission_bonus"] = row["mission_bonus"] or 0
+            rec["mission_all_clear"] = bool(row["mission_all_clear"])
             rec["settlement_date"] = row["settlement_date"]
             out.append(rec)
         return out
+
+
+def load_mission_days() -> list[dict]:
+    """모든 배치에 걸쳐 라이더별 (정산일, ALL CLEAR 여부) 목록 - 주간보너스 계산용."""
+    with engine.begin() as conn:
+        rows = conn.execute(
+            select(settlement_records.c.name, settlement_records.c.mission_all_clear,
+                   settlement_batches.c.settlement_date)
+            .join(settlement_batches, settlement_records.c.batch_id == settlement_batches.c.id)
+        ).mappings().all()
+        return [
+            {"name": r["name"], "settlement_date": r["settlement_date"],
+             "mission_all_clear": bool(r["mission_all_clear"])}
+            for r in rows
+        ]
 
 
 def load_all_rider_history() -> list[dict]:

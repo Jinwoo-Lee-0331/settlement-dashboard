@@ -29,11 +29,13 @@ COLUMNS = [
     {"name": "수수료", "id": "commission"},
     {"name": "원천세(3.3%)", "id": "withholding"},
     {"name": "선정산", "id": "prepaid"},
+    {"name": "미션보너스", "id": "mission_bonus"},
+    {"name": "주간보너스", "id": "weekly_bonus"},
     {"name": "최종정산금액", "id": "final"},
 ]
 
 MONEY_FIELDS = {"gross", "ins_refund", "expected", "commission",
-                 "withholding", "prepaid", "final"}
+                 "withholding", "prepaid", "mission_bonus", "weekly_bonus", "final"}
 
 UPLOAD_STYLE = {
     "width": "100%", "height": "56px", "lineHeight": "56px",
@@ -63,6 +65,8 @@ def _sample_records():
     recs = data.SETTLEMENT[db.RECORD_FIELDS].to_dict("records")
     for r in recs:
         r["platforms"] = "-"
+        r["mission_bonus"] = 0
+        r["weekly_bonus"] = 0
     return recs
 
 
@@ -83,18 +87,46 @@ def _settlement_display_records(records):
 def _aggregate_by_rider(rows: list[dict]) -> list[dict]:
     agg: dict[str, dict] = {}
     for r in rows:
-        d = agg.setdefault(r["name"], {"name": r["name"], "platforms": set()})
+        d = agg.setdefault(r["name"], {"name": r["name"], "platforms": set(), "mission_bonus": 0.0})
         for f in db.RECORD_FIELDS:
             if f in ("rider_id", "name"):
                 continue
             d[f] = d.get(f, 0) + (r.get(f) or 0)
+        d["mission_bonus"] += r.get("mission_bonus") or 0
         if r.get("platforms"):
             d["platforms"].update(r["platforms"].split(","))
     result = []
     for d in agg.values():
         d["platforms"] = ",".join(sorted(d["platforms"]))
+        d["weekly_bonus"] = 0
         result.append(d)
     return sorted(result, key=lambda x: -x["gross"])
+
+
+def _compute_weekly_bonuses(start_date: str, end_date: str) -> dict[str, int]:
+    """이름 -> 이 기간에 걸친 주(월~일)의 ALL CLEAR 6일 이상 달성 주간보너스 합계.
+
+    주간 ALL CLEAR 횟수는 저장된 전체 이력을 기준으로 세되, 보너스는 그 주의
+    시작일(월요일)이 선택한 기간 안에 있을 때만 이번 조회에 포함한다.
+    """
+    mission_days = db.load_mission_days()
+    weeks: dict[tuple, int] = {}
+    for r in mission_days:
+        if not r["mission_all_clear"]:
+            continue
+        d = datetime.fromisoformat(r["settlement_date"]).date()
+        week_start = d - timedelta(days=d.weekday())
+        key = (r["name"], week_start)
+        weeks[key] = weeks.get(key, 0) + 1
+
+    range_start = datetime.fromisoformat(start_date).date()
+    range_end = datetime.fromisoformat(end_date).date()
+
+    bonuses: dict[str, int] = {}
+    for (name, week_start), count in weeks.items():
+        if count >= parsers.MISSION_WEEKLY_MIN_DAYS and range_start <= week_start <= range_end:
+            bonuses[name] = bonuses.get(name, 0) + parsers.MISSION_WEEKLY_BONUS
+    return bonuses
 
 
 def _aggregate_by_day(rows: list[dict]) -> list[dict]:
@@ -339,7 +371,8 @@ def _apply_upload(n_clicks, coupang_contents, coupang_filenames, coupang_pw,
     coupang_names = ", ".join(fn for _, fn in coupang_list) or "-"
     baemin_names = ", ".join(fn for _, fn in baemin_list) or "-"
     for date, df in merged_by_date.items():
-        records = df[db.RECORD_FIELDS + ["platforms"]].to_dict("records")
+        cols = db.RECORD_FIELDS + ["platforms", "mission_bonus", "mission_all_clear"]
+        records = df[cols].to_dict("records")
         db.save_batch(records, date, coupang_names, baemin_names)
 
     dates = sorted(merged_by_date.keys())
@@ -397,6 +430,13 @@ def _render(query, start_date, end_date):
 
     per_rider = _aggregate_by_rider(raw_rows)
     per_day = _aggregate_by_day(raw_rows)
+
+    weekly_bonuses = _compute_weekly_bonuses(start_date, end_date)
+    for r in per_rider:
+        wb = weekly_bonuses.get(r["name"], 0)
+        r["weekly_bonus"] = wb
+        r["final"] += wb
+
     table_data, count_text, kpis = _build_table_and_kpi(per_rider, query)
     badge = _source_badge_upload(start_date, end_date)
     trend = _trend_graph(per_day) if len(per_day) > 1 else None

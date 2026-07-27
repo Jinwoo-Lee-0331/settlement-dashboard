@@ -236,7 +236,9 @@ def layout():
     bounds = db.load_date_bounds()
     if bounds:
         min_date, max_date = bounds
-        start_date = end_date = max_date
+        # 기본값은 업로드된 전체 기간 - 새로고침해도 방금 올린 데이터가 그대로 보이도록.
+        # "최근 정산일" 버튼으로 언제든 하루만 좁혀 볼 수 있다.
+        start_date, end_date = min_date, max_date
     else:
         min_date = max_date = start_date = end_date = None
 

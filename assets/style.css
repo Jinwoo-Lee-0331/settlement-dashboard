@@ -115,3 +115,78 @@ body {
     background: #fafbfc;
 }
 .upload-box:hover { border-color: #4f46e5; color: #4f46e5; }
+
+/* ---- 모바일 대응 (사이드바 -> 상단 바) ---- */
+@media (max-width: 768px) {
+    .app-shell {
+        flex-direction: column;
+        min-height: auto;
+    }
+
+    .sidebar {
+        width: 100%;
+        min-width: 0;
+        height: auto;
+        position: relative;
+        top: auto;
+        padding: 8px 10px;
+        border-right: none;
+        border-bottom: 1px solid #eceef2;
+    }
+
+    .brand {
+        padding: 4px 4px 8px;
+        border-bottom: none;
+    }
+
+    .brand-text { font-size: 14px; }
+    .brand-logo { font-size: 18px; }
+
+    .sidebar .nav {
+        flex-direction: row !important;
+        flex-wrap: nowrap;
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+        gap: 4px;
+    }
+
+    .sidebar-link {
+        white-space: nowrap;
+        padding: 8px 12px !important;
+        font-size: 13px;
+        margin-bottom: 0;
+    }
+
+    .content {
+        max-width: 100%;
+        padding: 14px 12px;
+    }
+
+    .page-title { font-size: 20px; }
+    .page-subtitle { font-size: 12px; }
+
+    .kpi-value { font-size: 19px; }
+    .kpi-title { font-size: 12px; }
+    .kpi-card .card-body { padding: 12px; }
+
+    .card-title { font-size: 15px; }
+    .card-sub { font-size: 11px; }
+
+    /* 컬럼이 많은 표는 가로 스크롤로 - 내부 셀 폰트/여백만 축소 */
+    .dash-table-container .dash-spreadsheet td,
+    .dash-table-container .dash-spreadsheet th {
+        font-size: 12px !important;
+        padding: 6px !important;
+    }
+
+    /* 날짜 선택기 등 인라인 컨트롤이 줄바꿈되도록 */
+    .panel .row.g-2,
+    .panel .row.g-3 {
+        row-gap: 8px;
+    }
+}
+
+@media (max-width: 420px) {
+    .page-title { font-size: 18px; }
+    .kpi-value { font-size: 17px; }
+}

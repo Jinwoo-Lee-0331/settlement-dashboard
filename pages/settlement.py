@@ -1,4 +1,4 @@
-"""정산 결과 페이지 - 라이더별 정산 상세 + 검색 + 실제 정산 엑셀 업로드(다중 파일/DB 영구 저장) + 기간 조회."""
+"""정산 결과 페이지 - 라이더별 일자별 정산 상세 + 검색 + 실제 정산 엑셀 업로드(다중 파일/DB 영구 저장) + 조회 모드."""
 
 import base64
 import os
@@ -20,6 +20,7 @@ DEFAULT_BAEMIN_PASSWORD = os.environ.get("BAEMIN_EXCEL_PASSWORD", "")
 dash.register_page(__name__, path="/settlement", name="정산 결과")
 
 COLUMNS = [
+    {"name": "일자", "id": "settlement_date"},
     {"name": "이름", "id": "name"},
     {"name": "플랫폼", "id": "platforms"},
     {"name": "총오더수", "id": "orders"},
@@ -34,12 +35,11 @@ COLUMNS = [
     {"name": "원천세(3.3%)", "id": "withholding"},
     {"name": "선정산", "id": "prepaid"},
     {"name": "미션보너스", "id": "mission_bonus"},
-    {"name": "주간보너스", "id": "weekly_bonus"},
     {"name": "최종정산금액", "id": "final"},
 ]
 
 MONEY_FIELDS = {"gross", "ins_refund", "expected", "commission",
-                 "withholding", "prepaid", "mission_bonus", "weekly_bonus", "final"}
+                 "withholding", "prepaid", "mission_bonus", "final"}
 
 UPLOAD_STYLE = {
     "width": "100%", "height": "56px", "lineHeight": "56px",
@@ -70,7 +70,7 @@ def _sample_records():
     for r in recs:
         r["platforms"] = "-"
         r["mission_bonus"] = 0
-        r["weekly_bonus"] = 0
+        r["settlement_date"] = "-"
         for b in parsers.MISSION_BUCKETS:
             r[b] = 0
     return recs
@@ -81,6 +81,7 @@ def _settlement_display_records(records):
     for r in records:
         rec = {
             "name": r["name"],
+            "settlement_date": r.get("settlement_date", "-"),
             "orders": f"{int(r['orders']):,}건",
             "platforms": r.get("platforms") or "-",
         }
@@ -90,30 +91,6 @@ def _settlement_display_records(records):
             rec[field] = won(r[field])
         recs.append(rec)
     return recs
-
-
-def _aggregate_by_rider(rows: list[dict]) -> list[dict]:
-    agg: dict[str, dict] = {}
-    for r in rows:
-        d = agg.setdefault(r["name"], {
-            "name": r["name"], "platforms": set(), "mission_bonus": 0.0,
-            **{b: 0.0 for b in parsers.MISSION_BUCKETS},
-        })
-        for f in db.RECORD_FIELDS:
-            if f in ("rider_id", "name"):
-                continue
-            d[f] = d.get(f, 0) + (r.get(f) or 0)
-        d["mission_bonus"] += r.get("mission_bonus") or 0
-        for b in parsers.MISSION_BUCKETS:
-            d[b] += r.get(b) or 0
-        if r.get("platforms"):
-            d["platforms"].update(r["platforms"].split(","))
-    result = []
-    for d in agg.values():
-        d["platforms"] = ",".join(sorted(d["platforms"]))
-        d["weekly_bonus"] = 0
-        result.append(d)
-    return sorted(result, key=lambda x: -x["gross"])
 
 
 def _compute_weekly_bonuses(start_date: str, end_date: str) -> dict[str, int]:
@@ -151,24 +128,29 @@ def _aggregate_by_day(rows: list[dict]) -> list[dict]:
     return sorted(agg.values(), key=lambda x: x["date"])
 
 
-def _build_table_and_kpi(records: list[dict], query: str | None):
-    total_gross = int(sum(r["gross"] for r in records))
-    total_final = int(sum(r["final"] for r in records))
-    kpis = dbc.Row(
+def _build_kpis(rows: list[dict], weekly_total: int):
+    names = {r["name"] for r in rows}
+    total_gross = int(sum(r["gross"] for r in rows))
+    total_final = int(sum(r["final"] for r in rows)) + weekly_total
+    return dbc.Row(
         [
-            kpi_card("정산 대상 라이더", f"{len(records)}명", "👥"),
+            kpi_card("정산 대상 라이더", f"{len(names)}명", "👥"),
             kpi_card("총 정산금액", won(total_gross), "💰"),
+            kpi_card("주간보너스 합계", won(weekly_total), "🎁"),
             kpi_card("최종 정산금액 합계", won(total_final), "📊"),
         ],
         className="g-3 mb-3",
     )
-    filtered = records
+
+
+def _table_rows(rows: list[dict], query: str | None):
+    filtered = rows
     if query:
         q = query.strip()
-        filtered = [r for r in records if q in r["name"]]
-    return (_settlement_display_records(filtered),
-            f"정산 대상 라이더수 : {len(filtered)}명",
-            kpis)
+        filtered = [r for r in rows if q in r["name"]]
+    ordered = sorted(filtered, key=lambda r: (r.get("settlement_date", ""), -r["gross"]))
+    return (_settlement_display_records(ordered),
+            f"정산 대상 라이더수 : {len({r['name'] for r in filtered})}명")
 
 
 def _source_badge_sample():
@@ -233,33 +215,46 @@ def _upload_card():
     ]), className="panel mb-3")
 
 
-def _period_controls(min_date, max_date, start_date, end_date):
+def _period_controls(min_date, max_date):
+    single_style = {"display": "none"}
+    range_style = {"display": "none"}
     return dbc.Card(dbc.CardBody([
         dbc.Row(
             [
                 dbc.Col(
                     dbc.ButtonGroup([
-                        dbc.Button("최근 정산일", id="btn-period-latest", size="sm",
+                        dbc.Button("최근정산일", id="btn-mode-latest", size="sm",
+                                   outline=True, color="secondary", active=True),
+                        dbc.Button("일별조회", id="btn-mode-daily", size="sm",
                                    outline=True, color="secondary"),
-                        dbc.Button("최근 7일", id="btn-period-7d", size="sm",
-                                   outline=True, color="secondary"),
-                        dbc.Button("전체 기간", id="btn-period-all", size="sm",
+                        dbc.Button("기간조회", id="btn-mode-range", size="sm",
                                    outline=True, color="secondary"),
                     ]),
+                    width="auto",
+                ),
+                dbc.Col(
+                    dcc.DatePickerSingle(
+                        id="settlement-date-single",
+                        min_date_allowed=min_date, max_date_allowed=max_date,
+                        date=max_date, display_format="YYYY-MM-DD",
+                        style=single_style,
+                    ),
                     width="auto",
                 ),
                 dbc.Col(
                     dcc.DatePickerRange(
                         id="settlement-date-range",
                         min_date_allowed=min_date, max_date_allowed=max_date,
-                        start_date=start_date, end_date=end_date,
+                        start_date=min_date, end_date=max_date,
                         display_format="YYYY-MM-DD",
+                        style=range_style,
                     ),
                     width="auto",
                 ),
             ],
             className="g-2 align-items-center",
         ),
+        dcc.Store(id="settlement-mode-store", data="latest"),
     ]), className="panel mb-3 py-1")
 
 
@@ -285,20 +280,14 @@ def _db_backend_badge():
 
 def layout():
     bounds = db.load_date_bounds()
-    if bounds:
-        min_date, max_date = bounds
-        # 기본값은 업로드된 전체 기간 - 새로고침해도 방금 올린 데이터가 그대로 보이도록.
-        # "최근 정산일" 버튼으로 언제든 하루만 좁혀 볼 수 있다.
-        start_date, end_date = min_date, max_date
-    else:
-        min_date = max_date = start_date = end_date = None
+    min_date, max_date = bounds if bounds else (None, None)
 
     return html.Div([
-        page_header("정산 결과", "라이더별 정산 상세 내역입니다."),
+        page_header("정산 결과", "라이더별 일자별 정산 상세 내역입니다."),
         _db_backend_badge(),
         _upload_card(),
         html.Div(id="settlement-source-badge"),
-        _period_controls(min_date, max_date, start_date, end_date),
+        _period_controls(min_date, max_date),
         html.Div(id="settlement-trend-graph-wrap"),
         html.Div(id="settlement-kpi-row"),
         dbc.Input(id="settlement-search", placeholder="라이더 검색...",
@@ -309,7 +298,7 @@ def layout():
             columns=COLUMNS,
             data=[],
             sort_action="native",
-            page_size=12,
+            page_size=15,
             style_cell={"padding": "10px", "fontSize": "13px",
                         "textAlign": "left", "fontFamily": "inherit"},
             style_header={"backgroundColor": "#f8f9fb", "fontWeight": "600"},
@@ -337,10 +326,14 @@ def _baemin_filename(filenames):
 
 
 @callback(
+    Output("settlement-mode-store", "data", allow_duplicate=True),
     Output("settlement-date-range", "start_date", allow_duplicate=True),
     Output("settlement-date-range", "end_date", allow_duplicate=True),
     Output("settlement-date-range", "min_date_allowed", allow_duplicate=True),
     Output("settlement-date-range", "max_date_allowed", allow_duplicate=True),
+    Output("settlement-date-single", "min_date_allowed", allow_duplicate=True),
+    Output("settlement-date-single", "max_date_allowed", allow_duplicate=True),
+    Output("settlement-date-single", "date", allow_duplicate=True),
     Output("upload-status", "children"),
     Input("apply-upload-btn", "n_clicks"),
     State("upload-coupang", "contents"),
@@ -353,7 +346,7 @@ def _baemin_filename(filenames):
 )
 def _apply_upload(n_clicks, coupang_contents, coupang_filenames, coupang_pw,
                    baemin_contents, baemin_filenames, baemin_pw):
-    no_change = (dash.no_update, dash.no_update, dash.no_update, dash.no_update)
+    no_change = (dash.no_update,) * 8
 
     coupang_list = _normalize_upload(coupang_contents, coupang_filenames)
     baemin_list = _normalize_upload(baemin_contents, baemin_filenames)
@@ -394,31 +387,38 @@ def _apply_upload(n_clicks, coupang_contents, coupang_filenames, coupang_pw,
     status = dbc.Alert(
         f"업로드 완료 및 저장됨 — {len(dates)}일치({dates[0]} ~ {dates[-1]}) 반영",
         color="success", className="mb-0 py-2")
-    return dates[0], dates[-1], min_date, max_date, status
+    return ("range", dates[0], dates[-1], min_date, max_date,
+            min_date, max_date, dates[-1], status)
 
 
 @callback(
-    Output("settlement-date-range", "start_date", allow_duplicate=True),
-    Output("settlement-date-range", "end_date", allow_duplicate=True),
-    Input("btn-period-latest", "n_clicks"),
-    Input("btn-period-7d", "n_clicks"),
-    Input("btn-period-all", "n_clicks"),
+    Output("settlement-mode-store", "data", allow_duplicate=True),
+    Input("btn-mode-latest", "n_clicks"),
+    Input("btn-mode-daily", "n_clicks"),
+    Input("btn-mode-range", "n_clicks"),
     prevent_initial_call=True,
 )
-def _quick_period(n_latest, n_7d, n_all):
-    bounds = db.load_date_bounds()
-    if not bounds:
-        return dash.no_update, dash.no_update
-    min_date, max_date = bounds
+def _set_mode(n_latest, n_daily, n_range):
     trigger = dash.ctx.triggered_id
-    if trigger == "btn-period-latest":
-        return max_date, max_date
-    if trigger == "btn-period-7d":
-        start = (datetime.fromisoformat(max_date) - timedelta(days=6)).strftime("%Y-%m-%d")
-        return max(start, min_date), max_date
-    if trigger == "btn-period-all":
-        return min_date, max_date
-    return dash.no_update, dash.no_update
+    return {
+        "btn-mode-latest": "latest",
+        "btn-mode-daily": "daily",
+        "btn-mode-range": "range",
+    }.get(trigger, "latest")
+
+
+@callback(
+    Output("settlement-date-single", "style"),
+    Output("settlement-date-range", "style"),
+    Output("btn-mode-latest", "active"),
+    Output("btn-mode-daily", "active"),
+    Output("btn-mode-range", "active"),
+    Input("settlement-mode-store", "data"),
+)
+def _toggle_pickers(mode):
+    single_style = {"display": "inline-block"} if mode == "daily" else {"display": "none"}
+    range_style = {"display": "inline-block"} if mode == "range" else {"display": "none"}
+    return single_style, range_style, mode == "latest", mode == "daily", mode == "range"
 
 
 @callback(
@@ -428,13 +428,27 @@ def _quick_period(n_latest, n_7d, n_all):
     Output("settlement-source-badge", "children"),
     Output("settlement-trend-graph-wrap", "children"),
     Input("settlement-search", "value"),
+    Input("settlement-mode-store", "data"),
+    Input("settlement-date-single", "date"),
     Input("settlement-date-range", "start_date"),
     Input("settlement-date-range", "end_date"),
 )
-def _render(query, start_date, end_date):
-    if not start_date or not end_date:
-        table_data, count_text, kpis = _build_table_and_kpi(_sample_records(), query)
+def _render(query, mode, single_date, range_start, range_end):
+    bounds = db.load_date_bounds()
+    if not bounds:
+        table_data, count_text = _table_rows(_sample_records(), query)
+        kpis = _build_kpis(_sample_records(), 0)
         return table_data, count_text, kpis, _source_badge_sample(), None
+
+    min_date, max_date = bounds
+    if mode == "daily":
+        day = single_date or max_date
+        start_date = end_date = day
+    elif mode == "range":
+        start_date = range_start or min_date
+        end_date = range_end or max_date
+    else:
+        start_date = end_date = max_date
 
     raw_rows = db.load_records_in_range(start_date, end_date)
     if not raw_rows:
@@ -442,16 +456,12 @@ def _render(query, start_date, end_date):
                                  color="warning", className="mb-0 py-2")
         return [], "정산 대상 라이더수 : 0명", dbc.Row(className="g-3 mb-3"), empty_alert, None
 
-    per_rider = _aggregate_by_rider(raw_rows)
-    per_day = _aggregate_by_day(raw_rows)
-
     weekly_bonuses = _compute_weekly_bonuses(start_date, end_date)
-    for r in per_rider:
-        wb = weekly_bonuses.get(r["name"], 0)
-        r["weekly_bonus"] = wb
-        r["final"] += wb
+    weekly_total = sum(weekly_bonuses.values())
 
-    table_data, count_text, kpis = _build_table_and_kpi(per_rider, query)
+    per_day = _aggregate_by_day(raw_rows)
+    table_data, count_text = _table_rows(raw_rows, query)
+    kpis = _build_kpis(raw_rows, weekly_total)
     badge = _source_badge_upload(start_date, end_date)
     trend = _trend_graph(per_day) if len(per_day) > 1 else None
     return table_data, count_text, kpis, badge, trend

@@ -23,6 +23,10 @@ COLUMNS = [
     {"name": "이름", "id": "name"},
     {"name": "플랫폼", "id": "platforms"},
     {"name": "총오더수", "id": "orders"},
+    {"name": "오전점심피크", "id": "오전점심피크"},
+    {"name": "오후논피크", "id": "오후논피크"},
+    {"name": "저녁피크", "id": "저녁피크"},
+    {"name": "심야", "id": "심야"},
     {"name": "총정산금액", "id": "gross"},
     {"name": "보험환급액", "id": "ins_refund"},
     {"name": "정산예정금액", "id": "expected"},
@@ -67,6 +71,8 @@ def _sample_records():
         r["platforms"] = "-"
         r["mission_bonus"] = 0
         r["weekly_bonus"] = 0
+        for b in parsers.MISSION_BUCKETS:
+            r[b] = 0
     return recs
 
 
@@ -78,6 +84,8 @@ def _settlement_display_records(records):
             "orders": f"{int(r['orders']):,}건",
             "platforms": r.get("platforms") or "-",
         }
+        for b in parsers.MISSION_BUCKETS:
+            rec[b] = f"{int(r.get(b, 0)):,}건"
         for field in MONEY_FIELDS:
             rec[field] = won(r[field])
         recs.append(rec)
@@ -87,12 +95,17 @@ def _settlement_display_records(records):
 def _aggregate_by_rider(rows: list[dict]) -> list[dict]:
     agg: dict[str, dict] = {}
     for r in rows:
-        d = agg.setdefault(r["name"], {"name": r["name"], "platforms": set(), "mission_bonus": 0.0})
+        d = agg.setdefault(r["name"], {
+            "name": r["name"], "platforms": set(), "mission_bonus": 0.0,
+            **{b: 0.0 for b in parsers.MISSION_BUCKETS},
+        })
         for f in db.RECORD_FIELDS:
             if f in ("rider_id", "name"):
                 continue
             d[f] = d.get(f, 0) + (r.get(f) or 0)
         d["mission_bonus"] += r.get("mission_bonus") or 0
+        for b in parsers.MISSION_BUCKETS:
+            d[b] += r.get(b) or 0
         if r.get("platforms"):
             d["platforms"].update(r["platforms"].split(","))
     result = []
@@ -371,7 +384,8 @@ def _apply_upload(n_clicks, coupang_contents, coupang_filenames, coupang_pw,
     coupang_names = ", ".join(fn for _, fn in coupang_list) or "-"
     baemin_names = ", ".join(fn for _, fn in baemin_list) or "-"
     for date, df in merged_by_date.items():
-        cols = db.RECORD_FIELDS + ["platforms", "mission_bonus", "mission_all_clear"]
+        cols = (db.RECORD_FIELDS + ["platforms", "mission_bonus", "mission_all_clear"]
+                + parsers.MISSION_BUCKETS)
         records = df[cols].to_dict("records")
         db.save_batch(records, date, coupang_names, baemin_names)
 

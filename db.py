@@ -25,6 +25,15 @@ RECORD_FIELDS = [
     "other_expense", "final",
 ]
 
+# 미션구간별 배달건수 (한글 키는 Python 쪽에서, 실제 DB 컬럼명은 영문으로 저장)
+MISSION_BUCKETS = ["오전점심피크", "오후논피크", "저녁피크", "심야"]
+_MISSION_BUCKET_DB_NAMES = {
+    "오전점심피크": "mission_lunch",
+    "오후논피크": "mission_afternoon",
+    "저녁피크": "mission_evening",
+    "심야": "mission_night",
+}
+
 _DATABASE_URL = os.environ.get("DATABASE_URL")
 if _DATABASE_URL:
     # Neon/Render 등은 postgres://로 주기도 하는데 SQLAlchemy 2.x는 postgresql:// 필요
@@ -55,12 +64,13 @@ settlement_records = Table(
     Column("mission_bonus", Float),  # 레드던 자체 미션 프로모션 당일 지급액 (final에 이미 합산됨)
     Column("mission_all_clear", Integer),  # 그 날 4구간 ALL CLEAR 여부 (0/1, 주간보너스 계산용)
     *[Column(f, Float) for f in RECORD_FIELDS if f != "name"],
+    *[Column(_MISSION_BUCKET_DB_NAMES[b], Float, key=b) for b in MISSION_BUCKETS],
 )
 
 
 def init_db():
     metadata.create_all(engine)
-    # 구버전 DB에 없던 컬럼들을 보정 (platforms, mission_bonus, mission_all_clear)
+    # 구버전 DB에 없던 컬럼들을 보정 (platforms, mission_bonus, mission_all_clear, 미션구간별 건수)
     inspector = inspect(engine)
     existing_cols = {c["name"] for c in inspector.get_columns("settlement_records")}
     with engine.begin() as conn:
@@ -70,6 +80,9 @@ def init_db():
             conn.execute(text("ALTER TABLE settlement_records ADD COLUMN mission_bonus FLOAT"))
         if "mission_all_clear" not in existing_cols:
             conn.execute(text("ALTER TABLE settlement_records ADD COLUMN mission_all_clear INTEGER"))
+        for db_name in _MISSION_BUCKET_DB_NAMES.values():
+            if db_name not in existing_cols:
+                conn.execute(text(f"ALTER TABLE settlement_records ADD COLUMN {db_name} FLOAT"))
 
 
 def _find_batch_id(conn, settlement_date: str):
@@ -114,6 +127,7 @@ def save_batch(records: list[dict], settlement_date: str,
                 "mission_bonus": r.get("mission_bonus", 0),
                 "mission_all_clear": int(r.get("mission_all_clear", 0)),
                 **{f: r.get(f, 0) for f in RECORD_FIELDS},
+                **{b: r.get(b, 0) for b in MISSION_BUCKETS},
             }
             for r in records
         ]
@@ -142,6 +156,7 @@ def load_latest_batch() -> tuple[list[dict], dict] | None:
                 "platforms": row["platforms"] or "",
                 "mission_bonus": row["mission_bonus"] or 0,
                 "mission_all_clear": bool(row["mission_all_clear"]),
+                **{b: (row[b] or 0) for b in MISSION_BUCKETS},
             }
             for row in rows
         ]
@@ -189,6 +204,8 @@ def load_records_in_range(start_date: str, end_date: str) -> list[dict]:
             rec["platforms"] = row["platforms"] or ""
             rec["mission_bonus"] = row["mission_bonus"] or 0
             rec["mission_all_clear"] = bool(row["mission_all_clear"])
+            for b in MISSION_BUCKETS:
+                rec[b] = row[b] or 0
             rec["settlement_date"] = row["settlement_date"]
             out.append(rec)
         return out

@@ -323,7 +323,7 @@ def parse_and_merge_multi(
         merged["mission_bonus"] = bonus_all_clear.map(lambda t: t[0])
         merged["mission_all_clear"] = bonus_all_clear.map(lambda t: t[1])
         merged["final"] = merged["final"] + merged["mission_bonus"]
-        merged = merged.drop(columns=MISSION_BUCKETS)
+        # MISSION_BUCKETS(구간별 배달건수)는 그대로 남겨서 저장/표시에 사용한다.
 
         result[date] = merged
 
